@@ -1,0 +1,90 @@
+kernel:
+  image: linuxkitprojects/kernel-shiftfs:4.11.4-881a041fc14bd95814cf140b5e98d97dd65160b5
+  cmdline: "console=ttyS0 console=tty0 page_poison=1"
+init:
+  - linuxkit/init:6b3755e47f00d6027321d3fca99a19af6504be75
+  - linuxkit/runc:52f92cb577879ce4cfe4e89be2d63af82523fc92
+  - mplatform/containerd:alpine
+  - linuxkit/ca-certificates:ea3c4c120f929f4f07ac8535d75933365b5e9582
+  - mplatform/examplectr:advanced
+onboot:
+  - name: sysctl
+    image: linuxkit/sysctl:1644bf07edbcaf5ce0bb764fa925b544183547f9
+  - name: dhcpcd
+    image: linuxkit/dhcpcd:aa685261ceb2557990dcfe9dd8824c6b9ec416e2
+    command: ["/sbin/dhcpcd", "--nobackground", "-f", "/dhcpcd.conf", "-1"]
+  - name: format
+    image: linuxkit/format:6b46d0450082f397177da36be6b4d74d93eacd1e
+  - name: mount
+    image: "linuxkit/mount:41685ecc8039643948e5dff46e17584753469a7a"
+    command: ["/usr/bin/mountie", "/dev/sda1", "/var/external"]
+services:
+  - name: getty
+    image: mplatform/getty:alpine
+    binds:
+     - /etc/resolv.conf:/etc/resolv.conf
+     - /run:/run
+     - /tmp:/tmp
+     - /etc:/hostroot/etc
+     - /usr/bin/ctr:/usr/bin/ctr
+     - /usr/bin/runc:/usr/bin/runc
+     - /containers:/containers
+     - /var/log:/var/log
+     - /dev:/dev
+     - /usr/bin/examplectr:/usr/bin/examplectr
+     - /etc/passwd:/etc/passwd
+     - /etc/subuid:/etc/subuid
+     - /etc/subgid:/etc/subgid
+     - /etc/tmux.conf:/root/.tmux.conf
+     - /usr/bin/startup.sh:/usr/bin/startup.sh
+    env:
+     - INSECURE=true
+  - name: rngd
+    image: linuxkit/rngd:45ed7759dd927f4cce3863073ea2e0da1d52a427
+  - name: nginx
+    image: nginx:alpine
+    capabilities:
+     - CAP_NET_BIND_SERVICE
+     - CAP_CHOWN
+     - CAP_SETUID
+     - CAP_SETGID
+     - CAP_DAC_OVERRIDE
+files:
+  - path: etc/subuid
+    mode: "0644"
+    contents: |
+      bob:100000:65536
+      alice:200000:65536
+  - path: etc/subgid
+    mode: "0644"
+    contents: |
+      bob:100000:65536
+      alice:200000:65536
+  - path: etc/passwd
+    mode: "0644"
+    contents: |
+      root:x:0:0:root:/root:/bin/sh
+      bob:x:1000:0:bob:/root:/bin/sh
+      alice:x:2000:0:alice:/root:/bin/sh
+  - path: /etc/tmux.conf
+    mode: "0644"
+    contents: |
+      set -g status-bg black
+      set -g status-fg white
+      set -g status-left "#[fg=green]#H"
+      set-window-option -g window-status-current-bg red
+      # remap prefix to Control + a
+      set -g prefix C-a
+      unbind C-b
+      bind C-a send-prefix
+      set-window-option -g mode-keys vi
+      set -g default-command /bin/bash
+      set -g default-shell /bin/bash
+  - path: /usr/bin/startup.sh
+    mode: "0755"
+    source: startup.sh
+trust:
+  org:
+    - linuxkit
+    - library
+    - mplatform
