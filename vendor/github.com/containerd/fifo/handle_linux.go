@@ -1,5 +1,21 @@
 // +build linux
 
+/*
+   Copyright The containerd Authors.
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
 package fifo
 
 import (
@@ -11,6 +27,7 @@ import (
 	"github.com/pkg/errors"
 )
 
+//nolint:golint
 const O_PATH = 010000000
 
 type handle struct {
@@ -40,9 +57,10 @@ func getHandle(fn string) (*handle, error) {
 	h := &handle{
 		f:    f,
 		name: fn,
-		dev:  uint64(stat.Dev),
-		ino:  stat.Ino,
-		fd:   fd,
+		//nolint:unconvert
+		dev: uint64(stat.Dev),
+		ino: stat.Ino,
+		fd:  fd,
 	}
 
 	// check /proc just in case
@@ -67,6 +85,7 @@ func (h *handle) Path() (string, error) {
 	if err := syscall.Stat(h.procPath(), &stat); err != nil {
 		return "", errors.Wrapf(err, "path %v could not be statted", h.procPath())
 	}
+	//nolint:unconvert
 	if uint64(stat.Dev) != h.dev || stat.Ino != h.ino {
 		return "", errors.Errorf("failed to verify handle %v/%v %v/%v", stat.Dev, h.dev, stat.Ino, h.ino)
 	}

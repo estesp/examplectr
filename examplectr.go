@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -20,6 +19,7 @@ const (
 )
 
 func main() {
+
 	var (
 		imageName string
 		command   string
@@ -83,8 +83,7 @@ func main() {
 	}
 
 	// create a task
-	stdouterr := bytes.NewBuffer(nil)
-	task, err := container.NewTask(ctx, cio.NewIO(bytes.NewBuffer(nil), stdouterr, stdouterr))
+	task, err := container.NewTask(ctx, cio.NewCreator(cio.WithStdio))
 	if err != nil {
 		log.Errorf("error creating task: %v", err)
 		return

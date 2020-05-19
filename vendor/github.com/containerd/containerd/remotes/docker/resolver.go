@@ -1,22 +1,37 @@
+/*
+   Copyright The containerd Authors.
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
 package docker
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
-	"net/url"
 	"path"
-	"strconv"
 	"strings"
-	"time"
 
+	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/reference"
 	"github.com/containerd/containerd/remotes"
+	"github.com/containerd/containerd/remotes/docker/schema1"
+	"github.com/containerd/containerd/version"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
@@ -32,46 +47,176 @@ var (
 	// ErrInvalidAuthorization is used when credentials are passed to a server but
 	// those credentials are rejected.
 	ErrInvalidAuthorization = errors.New("authorization failed")
+
+	// MaxManifestSize represents the largest size accepted from a registry
+	// during resolution. Larger manifests may be accepted using a
+	// resolution method other than the registry.
+	//
+	// NOTE: The max supported layers by some runtimes is 128 and individual
+	// layers will not contribute more than 256 bytes, making a
+	// reasonable limit for a large image manifests of 32K bytes.
+	// 4M bytes represents a much larger upper bound for images which may
+	// contain large annotations or be non-images. A proper manifest
+	// design puts large metadata in subobjects, as is consistent the
+	// intent of the manifest design.
+	MaxManifestSize int64 = 4 * 1048 * 1048
 )
 
-type dockerResolver struct {
-	credentials func(string) (string, string, error)
-	plainHTTP   bool
-	client      *http.Client
-	tracker     StatusTracker
+// Authorizer is used to authorize HTTP requests based on 401 HTTP responses.
+// An Authorizer is responsible for caching tokens or credentials used by
+// requests.
+type Authorizer interface {
+	// Authorize sets the appropriate `Authorization` header on the given
+	// request.
+	//
+	// If no authorization is found for the request, the request remains
+	// unmodified. It may also add an `Authorization` header as
+	//  "bearer <some bearer token>"
+	//  "basic <base64 encoded credentials>"
+	Authorize(context.Context, *http.Request) error
+
+	// AddResponses adds a 401 response for the authorizer to consider when
+	// authorizing requests. The last response should be unauthorized and
+	// the previous requests are used to consider redirects and retries
+	// that may have led to the 401.
+	//
+	// If response is not handled, returns `ErrNotImplemented`
+	AddResponses(context.Context, []*http.Response) error
 }
 
 // ResolverOptions are used to configured a new Docker register resolver
 type ResolverOptions struct {
-	// Credentials provides username and secret given a host.
-	// If username is empty but a secret is given, that secret
-	// is interpretted as a long lived token.
-	Credentials func(string) (string, string, error)
+	// Hosts returns registry host configurations for a namespace.
+	Hosts RegistryHosts
 
-	// PlainHTTP specifies to use plain http and not https
-	PlainHTTP bool
-
-	// Client is the http client to used when making registry requests
-	Client *http.Client
+	// Headers are the HTTP request header fields sent by the resolver
+	Headers http.Header
 
 	// Tracker is used to track uploads to the registry. This is used
 	// since the registry does not have upload tracking and the existing
 	// mechanism for getting blob upload status is expensive.
 	Tracker StatusTracker
+
+	// Authorizer is used to authorize registry requests
+	// Deprecated: use Hosts
+	Authorizer Authorizer
+
+	// Credentials provides username and secret given a host.
+	// If username is empty but a secret is given, that secret
+	// is interpreted as a long lived token.
+	// Deprecated: use Hosts
+	Credentials func(string) (string, string, error)
+
+	// Host provides the hostname given a namespace.
+	// Deprecated: use Hosts
+	Host func(string) (string, error)
+
+	// PlainHTTP specifies to use plain http and not https
+	// Deprecated: use Hosts
+	PlainHTTP bool
+
+	// Client is the http client to used when making registry requests
+	// Deprecated: use Hosts
+	Client *http.Client
+}
+
+// DefaultHost is the default host function.
+func DefaultHost(ns string) (string, error) {
+	if ns == "docker.io" {
+		return "registry-1.docker.io", nil
+	}
+	return ns, nil
+}
+
+type dockerResolver struct {
+	hosts         RegistryHosts
+	header        http.Header
+	resolveHeader http.Header
+	tracker       StatusTracker
 }
 
 // NewResolver returns a new resolver to a Docker registry
 func NewResolver(options ResolverOptions) remotes.Resolver {
-	tracker := options.Tracker
-	if tracker == nil {
-		tracker = NewInMemoryTracker()
+	if options.Tracker == nil {
+		options.Tracker = NewInMemoryTracker()
+	}
+
+	if options.Headers == nil {
+		options.Headers = make(http.Header)
+	}
+	if _, ok := options.Headers["User-Agent"]; !ok {
+		options.Headers.Set("User-Agent", "containerd/"+version.Version)
+	}
+
+	resolveHeader := http.Header{}
+	if _, ok := options.Headers["Accept"]; !ok {
+		// set headers for all the types we support for resolution.
+		resolveHeader.Set("Accept", strings.Join([]string{
+			images.MediaTypeDockerSchema2Manifest,
+			images.MediaTypeDockerSchema2ManifestList,
+			ocispec.MediaTypeImageManifest,
+			ocispec.MediaTypeImageIndex, "*/*"}, ", "))
+	} else {
+		resolveHeader["Accept"] = options.Headers["Accept"]
+		delete(options.Headers, "Accept")
+	}
+
+	if options.Hosts == nil {
+		opts := []RegistryOpt{}
+		if options.Host != nil {
+			opts = append(opts, WithHostTranslator(options.Host))
+		}
+
+		if options.Authorizer == nil {
+			options.Authorizer = NewDockerAuthorizer(
+				WithAuthClient(options.Client),
+				WithAuthHeader(options.Headers),
+				WithAuthCreds(options.Credentials))
+		}
+		opts = append(opts, WithAuthorizer(options.Authorizer))
+
+		if options.Client != nil {
+			opts = append(opts, WithClient(options.Client))
+		}
+		if options.PlainHTTP {
+			opts = append(opts, WithPlainHTTP(MatchAllHosts))
+		} else {
+			opts = append(opts, WithPlainHTTP(MatchLocalhost))
+		}
+		options.Hosts = ConfigureDefaultRegistries(opts...)
 	}
 	return &dockerResolver{
-		credentials: options.Credentials,
-		plainHTTP:   options.PlainHTTP,
-		client:      options.Client,
-		tracker:     tracker,
+		hosts:         options.Hosts,
+		header:        options.Headers,
+		resolveHeader: resolveHeader,
+		tracker:       options.Tracker,
 	}
+}
+
+func getManifestMediaType(resp *http.Response) string {
+	// Strip encoding data (manifests should always be ascii JSON)
+	contentType := resp.Header.Get("Content-Type")
+	if sp := strings.IndexByte(contentType, ';'); sp != -1 {
+		contentType = contentType[0:sp]
+	}
+
+	// As of Apr 30 2019 the registry.access.redhat.com registry does not specify
+	// the content type of any data but uses schema1 manifests.
+	if contentType == "text/plain" {
+		contentType = images.MediaTypeDockerSchema1Manifest
+	}
+	return contentType
+}
+
+type countingReader struct {
+	reader    io.Reader
+	bytesRead int64
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	r.bytesRead += int64(n)
+	return n, err
 }
 
 var _ remotes.Resolver = &dockerResolver{}
@@ -91,13 +236,11 @@ func (r *dockerResolver) Resolve(ctx context.Context, ref string) (string, ocisp
 		return "", ocispec.Descriptor{}, err
 	}
 
-	fetcher := dockerFetcher{
-		dockerBase: base,
-	}
-
 	var (
-		urls []string
-		dgst = refspec.Digest()
+		lastErr error
+		paths   [][]string
+		dgst    = refspec.Digest()
+		caps    = HostCapabilityPull
 	)
 
 	if dgst != "" {
@@ -108,86 +251,134 @@ func (r *dockerResolver) Resolve(ctx context.Context, ref string) (string, ocisp
 		}
 
 		// turns out, we have a valid digest, make a url.
-		urls = append(urls, fetcher.url("manifests", dgst.String()))
+		paths = append(paths, []string{"manifests", dgst.String()})
 
 		// fallback to blobs on not found.
-		urls = append(urls, fetcher.url("blobs", dgst.String()))
+		paths = append(paths, []string{"blobs", dgst.String()})
 	} else {
-		urls = append(urls, fetcher.url("manifests", refspec.Object))
+		// Add
+		paths = append(paths, []string{"manifests", refspec.Object})
+		caps |= HostCapabilityResolve
+	}
+
+	hosts := base.filterHosts(caps)
+	if len(hosts) == 0 {
+		return "", ocispec.Descriptor{}, errors.Wrap(errdefs.ErrNotFound, "no resolve hosts")
 	}
 
 	ctx, err = contextWithRepositoryScope(ctx, refspec, false)
 	if err != nil {
 		return "", ocispec.Descriptor{}, err
 	}
-	for _, u := range urls {
-		req, err := http.NewRequest(http.MethodHead, u, nil)
-		if err != nil {
-			return "", ocispec.Descriptor{}, err
-		}
 
-		// set headers for all the types we support for resolution.
-		req.Header.Set("Accept", strings.Join([]string{
-			images.MediaTypeDockerSchema2Manifest,
-			images.MediaTypeDockerSchema2ManifestList,
-			ocispec.MediaTypeImageManifest,
-			ocispec.MediaTypeImageIndex, "*"}, ", "))
+	for _, u := range paths {
+		for _, host := range hosts {
+			ctx := log.WithLogger(ctx, log.G(ctx).WithField("host", host.Host))
 
-		log.G(ctx).Debug("resolving")
-		resp, err := fetcher.doRequestWithRetries(ctx, req, nil)
-		if err != nil {
-			return "", ocispec.Descriptor{}, err
-		}
-		resp.Body.Close() // don't care about body contents.
+			req := base.request(host, http.MethodHead, u...)
+			for key, value := range r.resolveHeader {
+				req.header[key] = append(req.header[key], value...)
+			}
 
-		if resp.StatusCode > 299 {
-			if resp.StatusCode == http.StatusNotFound {
+			log.G(ctx).Debug("resolving")
+			resp, err := req.doWithRetries(ctx, nil)
+			if err != nil {
+				if errors.Is(err, ErrInvalidAuthorization) {
+					err = errors.Wrapf(err, "pull access denied, repository does not exist or may require authorization")
+				}
+				// Store the error for referencing later
+				if lastErr == nil {
+					lastErr = err
+				}
+				continue // try another host
+			}
+			resp.Body.Close() // don't care about body contents.
+
+			if resp.StatusCode > 299 {
+				if resp.StatusCode == http.StatusNotFound {
+					continue
+				}
+				return "", ocispec.Descriptor{}, errors.Errorf("unexpected status code %v: %v", u, resp.Status)
+			}
+			size := resp.ContentLength
+			contentType := getManifestMediaType(resp)
+
+			// if no digest was provided, then only a resolve
+			// trusted registry was contacted, in this case use
+			// the digest header (or content from GET)
+			if dgst == "" {
+				// this is the only point at which we trust the registry. we use the
+				// content headers to assemble a descriptor for the name. when this becomes
+				// more robust, we mostly get this information from a secure trust store.
+				dgstHeader := digest.Digest(resp.Header.Get("Docker-Content-Digest"))
+
+				if dgstHeader != "" && size != -1 {
+					if err := dgstHeader.Validate(); err != nil {
+						return "", ocispec.Descriptor{}, errors.Wrapf(err, "%q in header not a valid digest", dgstHeader)
+					}
+					dgst = dgstHeader
+				}
+			}
+			if dgst == "" || size == -1 {
+				log.G(ctx).Debug("no Docker-Content-Digest header, fetching manifest instead")
+
+				req = base.request(host, http.MethodGet, u...)
+				for key, value := range r.resolveHeader {
+					req.header[key] = append(req.header[key], value...)
+				}
+
+				resp, err := req.doWithRetries(ctx, nil)
+				if err != nil {
+					return "", ocispec.Descriptor{}, err
+				}
+				defer resp.Body.Close()
+
+				bodyReader := countingReader{reader: resp.Body}
+
+				contentType = getManifestMediaType(resp)
+				if dgst == "" {
+					if contentType == images.MediaTypeDockerSchema1Manifest {
+						b, err := schema1.ReadStripSignature(&bodyReader)
+						if err != nil {
+							return "", ocispec.Descriptor{}, err
+						}
+
+						dgst = digest.FromBytes(b)
+					} else {
+						dgst, err = digest.FromReader(&bodyReader)
+						if err != nil {
+							return "", ocispec.Descriptor{}, err
+						}
+					}
+				} else if _, err := io.Copy(ioutil.Discard, &bodyReader); err != nil {
+					return "", ocispec.Descriptor{}, err
+				}
+				size = bodyReader.bytesRead
+			}
+			// Prevent resolving to excessively large manifests
+			if size > MaxManifestSize {
+				if lastErr == nil {
+					lastErr = errors.Wrapf(errdefs.ErrNotFound, "rejecting %d byte manifest for %s", size, ref)
+				}
 				continue
 			}
-			return "", ocispec.Descriptor{}, errors.Errorf("unexpected status code %v: %v", u, resp.Status)
-		}
 
-		// this is the only point at which we trust the registry. we use the
-		// content headers to assemble a descriptor for the name. when this becomes
-		// more robust, we mostly get this information from a secure trust store.
-		dgstHeader := digest.Digest(resp.Header.Get("Docker-Content-Digest"))
-
-		if dgstHeader != "" {
-			if err := dgstHeader.Validate(); err != nil {
-				return "", ocispec.Descriptor{}, errors.Wrapf(err, "%q in header not a valid digest", dgstHeader)
+			desc := ocispec.Descriptor{
+				Digest:    dgst,
+				MediaType: contentType,
+				Size:      size,
 			}
-			dgst = dgstHeader
+
+			log.G(ctx).WithField("desc.digest", desc.Digest).Debug("resolved")
+			return ref, desc, nil
 		}
-
-		if dgst == "" {
-			return "", ocispec.Descriptor{}, errors.Errorf("could not resolve digest for %v", ref)
-		}
-
-		var (
-			size       int64
-			sizeHeader = resp.Header.Get("Content-Length")
-		)
-
-		size, err = strconv.ParseInt(sizeHeader, 10, 64)
-		if err != nil {
-
-			return "", ocispec.Descriptor{}, errors.Wrapf(err, "invalid size header: %q", sizeHeader)
-		}
-		if size < 0 {
-			return "", ocispec.Descriptor{}, errors.Errorf("%q in header not a valid size", sizeHeader)
-		}
-
-		desc := ocispec.Descriptor{
-			Digest:    dgst,
-			MediaType: resp.Header.Get("Content-Type"), // need to strip disposition?
-			Size:      size,
-		}
-
-		log.G(ctx).WithField("desc.digest", desc.Digest).Debug("resolved")
-		return ref, desc, nil
 	}
 
-	return "", ocispec.Descriptor{}, errors.Errorf("%v not found", ref)
+	if lastErr == nil {
+		lastErr = errors.Wrap(errdefs.ErrNotFound, ref)
+	}
+
+	return "", ocispec.Descriptor{}, lastErr
 }
 
 func (r *dockerResolver) Fetcher(ctx context.Context, ref string) (remotes.Fetcher, error) {
@@ -212,13 +403,6 @@ func (r *dockerResolver) Pusher(ctx context.Context, ref string) (remotes.Pusher
 		return nil, err
 	}
 
-	// Manifests can be pushed by digest like any other object, but the passed in
-	// reference cannot take a digest without the associated content. A tag is allowed
-	// and will be used to tag pushed manifests.
-	if refspec.Object != "" && strings.Contains(refspec.Object, "@") {
-		return nil, errors.New("cannot use digest reference for push locator")
-	}
-
 	base, err := r.base(refspec)
 	if err != nil {
 		return nil, err
@@ -226,340 +410,202 @@ func (r *dockerResolver) Pusher(ctx context.Context, ref string) (remotes.Pusher
 
 	return dockerPusher{
 		dockerBase: base,
-		tag:        refspec.Object,
+		object:     refspec.Object,
 		tracker:    r.tracker,
 	}, nil
 }
 
 type dockerBase struct {
-	refspec reference.Spec
-	base    url.URL
-	token   string
-
-	client   *http.Client
-	useBasic bool
-	username string
-	secret   string
+	refspec   reference.Spec
+	namespace string
+	hosts     []RegistryHost
+	header    http.Header
 }
 
 func (r *dockerResolver) base(refspec reference.Spec) (*dockerBase, error) {
-	var (
-		err              error
-		base             url.URL
-		username, secret string
-	)
-
 	host := refspec.Hostname()
-	base.Scheme = "https"
-
-	if host == "docker.io" {
-		base.Host = "registry-1.docker.io"
-	} else {
-		base.Host = host
-
-		if r.plainHTTP || strings.HasPrefix(host, "localhost:") {
-			base.Scheme = "http"
-		}
+	hosts, err := r.hosts(host)
+	if err != nil {
+		return nil, err
 	}
-
-	if r.credentials != nil {
-		username, secret, err = r.credentials(base.Host)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	prefix := strings.TrimPrefix(refspec.Locator, host+"/")
-	base.Path = path.Join("/v2", prefix)
-
 	return &dockerBase{
-		refspec:  refspec,
-		base:     base,
-		client:   r.client,
-		username: username,
-		secret:   secret,
+		refspec:   refspec,
+		namespace: strings.TrimPrefix(refspec.Locator, host+"/"),
+		hosts:     hosts,
+		header:    r.header,
 	}, nil
 }
 
-func (r *dockerBase) url(ps ...string) string {
-	url := r.base
-	url.Path = path.Join(url.Path, path.Join(ps...))
-	return url.String()
-}
-
-func (r *dockerBase) authorize(req *http.Request) {
-	if r.useBasic {
-		req.SetBasicAuth(r.username, r.secret)
-	} else if r.token != "" {
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", r.token))
-	}
-}
-
-func (r *dockerBase) doRequest(ctx context.Context, req *http.Request) (*http.Response, error) {
-	ctx = log.WithLogger(ctx, log.G(ctx).WithField("url", req.URL.String()))
-	log.G(ctx).WithField("request.headers", req.Header).WithField("request.method", req.Method).Debug("do request")
-	r.authorize(req)
-	resp, err := ctxhttp.Do(ctx, r.client, req)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to do request")
-	}
-	log.G(ctx).WithFields(logrus.Fields{
-		"status":           resp.Status,
-		"response.headers": resp.Header,
-	}).Debug("fetch response received")
-	return resp, nil
-}
-
-func (r *dockerBase) doRequestWithRetries(ctx context.Context, req *http.Request, responses []*http.Response) (*http.Response, error) {
-	resp, err := r.doRequest(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-
-	responses = append(responses, resp)
-	req, err = r.retryRequest(ctx, req, responses)
-	if err != nil {
-		resp.Body.Close()
-		return nil, err
-	}
-	if req != nil {
-		resp.Body.Close()
-		return r.doRequestWithRetries(ctx, req, responses)
-	}
-	return resp, err
-}
-
-func (r *dockerBase) retryRequest(ctx context.Context, req *http.Request, responses []*http.Response) (*http.Request, error) {
-	if len(responses) > 5 {
-		return nil, nil
-	}
-	last := responses[len(responses)-1]
-	if last.StatusCode == http.StatusUnauthorized {
-		log.G(ctx).WithField("header", last.Header.Get("WWW-Authenticate")).Debug("Unauthorized")
-		for _, c := range parseAuthHeader(last.Header) {
-			if c.scheme == bearerAuth {
-				if err := invalidAuthorization(c, responses); err != nil {
-					r.token = ""
-					return nil, err
-				}
-				if err := r.setTokenAuth(ctx, c.parameters); err != nil {
-					return nil, err
-				}
-				return copyRequest(req)
-			} else if c.scheme == basicAuth {
-				if r.username != "" && r.secret != "" {
-					r.useBasic = true
-				}
-				return copyRequest(req)
-			}
-		}
-		return nil, nil
-	} else if last.StatusCode == http.StatusMethodNotAllowed && req.Method == http.MethodHead {
-		// Support registries which have not properly implemented the HEAD method for
-		// manifests endpoint
-		if strings.Contains(req.URL.Path, "/manifests/") {
-			// TODO: copy request?
-			req.Method = http.MethodGet
-			return copyRequest(req)
+func (r *dockerBase) filterHosts(caps HostCapabilities) (hosts []RegistryHost) {
+	for _, host := range r.hosts {
+		if host.Capabilities.Has(caps) {
+			hosts = append(hosts, host)
 		}
 	}
-
-	// TODO: Handle 50x errors accounting for attempt history
-	return nil, nil
+	return
 }
 
-func invalidAuthorization(c challenge, responses []*http.Response) error {
-	errStr := c.parameters["error"]
-	if errStr == "" {
-		return nil
+func (r *dockerBase) request(host RegistryHost, method string, ps ...string) *request {
+	header := http.Header{}
+	for key, value := range r.header {
+		header[key] = append(header[key], value...)
 	}
-
-	n := len(responses)
-	if n == 1 || (n > 1 && !sameRequest(responses[n-2].Request, responses[n-1].Request)) {
-		return nil
+	parts := append([]string{"/", host.Path, r.namespace}, ps...)
+	p := path.Join(parts...)
+	// Join strips trailing slash, re-add ending "/" if included
+	if len(parts) > 0 && strings.HasSuffix(parts[len(parts)-1], "/") {
+		p = p + "/"
 	}
-
-	return errors.Wrapf(ErrInvalidAuthorization, "server message: %s", errStr)
+	return &request{
+		method: method,
+		path:   p,
+		header: header,
+		host:   host,
+	}
 }
 
-func sameRequest(r1, r2 *http.Request) bool {
-	if r1.Method != r2.Method {
-		return false
-	}
-	if *r1.URL != *r2.URL {
-		return false
-	}
-	return true
-}
-
-func copyRequest(req *http.Request) (*http.Request, error) {
-	ireq := *req
-	if ireq.GetBody != nil {
-		var err error
-		ireq.Body, err = ireq.GetBody()
-		if err != nil {
-			return nil, err
-		}
-	}
-	return &ireq, nil
-}
-
-func (r *dockerBase) setTokenAuth(ctx context.Context, params map[string]string) error {
-	realm, ok := params["realm"]
-	if !ok {
-		return errors.New("no realm specified for token auth challenge")
-	}
-
-	realmURL, err := url.Parse(realm)
-	if err != nil {
-		return fmt.Errorf("invalid token auth challenge realm: %s", err)
-	}
-
-	to := tokenOptions{
-		realm:   realmURL.String(),
-		service: params["service"],
-	}
-
-	to.scopes = getTokenScopes(ctx, params)
-	if len(to.scopes) == 0 {
-		return errors.Errorf("no scope specified for token auth challenge")
-	}
-	if r.secret != "" {
-		// Credential information is provided, use oauth POST endpoint
-		r.token, err = r.fetchTokenWithOAuth(ctx, to)
-		if err != nil {
-			return errors.Wrap(err, "failed to fetch oauth token")
-		}
-	} else {
-		// Do request anonymously
-		r.token, err = r.getToken(ctx, to)
-		if err != nil {
-			return errors.Wrap(err, "failed to fetch anonymous token")
+func (r *request) authorize(ctx context.Context, req *http.Request) error {
+	// Check if has header for host
+	if r.host.Authorizer != nil {
+		if err := r.host.Authorizer.Authorize(ctx, req); err != nil {
+			return err
 		}
 	}
 
 	return nil
 }
 
-type tokenOptions struct {
-	realm   string
-	service string
-	scopes  []string
+type request struct {
+	method string
+	path   string
+	header http.Header
+	host   RegistryHost
+	body   func() (io.ReadCloser, error)
+	size   int64
 }
 
-type postTokenResponse struct {
-	AccessToken  string    `json:"access_token"`
-	RefreshToken string    `json:"refresh_token"`
-	ExpiresIn    int       `json:"expires_in"`
-	IssuedAt     time.Time `json:"issued_at"`
-	Scope        string    `json:"scope"`
-}
-
-func (r *dockerBase) fetchTokenWithOAuth(ctx context.Context, to tokenOptions) (string, error) {
-	form := url.Values{}
-	form.Set("scope", strings.Join(to.scopes, " "))
-	form.Set("service", to.service)
-	// TODO: Allow setting client_id
-	form.Set("client_id", "containerd-dist-tool")
-
-	if r.username == "" {
-		form.Set("grant_type", "refresh_token")
-		form.Set("refresh_token", r.secret)
-	} else {
-		form.Set("grant_type", "password")
-		form.Set("username", r.username)
-		form.Set("password", r.secret)
-	}
-
-	resp, err := ctxhttp.PostForm(ctx, r.client, to.realm, form)
+func (r *request) do(ctx context.Context) (*http.Response, error) {
+	u := r.host.Scheme + "://" + r.host.Host + r.path
+	req, err := http.NewRequest(r.method, u, nil)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	defer resp.Body.Close()
-
-	// Registries without support for POST may return 404 for POST /v2/token.
-	// As of September 2017, GCR is known to return 404.
-	if (resp.StatusCode == 405 && r.username != "") || resp.StatusCode == 404 {
-		return r.getToken(ctx, to)
-	} else if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		b, _ := ioutil.ReadAll(io.LimitReader(resp.Body, 64000)) // 64KB
-		log.G(ctx).WithFields(logrus.Fields{
-			"status": resp.Status,
-			"body":   string(b),
-		}).Debugf("token request failed")
-		// TODO: handle error body and write debug output
-		return "", errors.Errorf("unexpected status: %s", resp.Status)
+	req.Header = r.header
+	if r.body != nil {
+		body, err := r.body()
+		if err != nil {
+			return nil, err
+		}
+		req.Body = body
+		req.GetBody = r.body
+		if r.size > 0 {
+			req.ContentLength = r.size
+		}
 	}
 
-	decoder := json.NewDecoder(resp.Body)
-
-	var tr postTokenResponse
-	if err = decoder.Decode(&tr); err != nil {
-		return "", fmt.Errorf("unable to decode token response: %s", err)
+	ctx = log.WithLogger(ctx, log.G(ctx).WithField("url", u))
+	log.G(ctx).WithFields(requestFields(req)).Debug("do request")
+	if err := r.authorize(ctx, req); err != nil {
+		return nil, errors.Wrap(err, "failed to authorize")
 	}
-
-	return tr.AccessToken, nil
+	resp, err := ctxhttp.Do(ctx, r.host.Client, req)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to do request")
+	}
+	log.G(ctx).WithFields(responseFields(resp)).Debug("fetch response received")
+	return resp, nil
 }
 
-type getTokenResponse struct {
-	Token        string    `json:"token"`
-	AccessToken  string    `json:"access_token"`
-	ExpiresIn    int       `json:"expires_in"`
-	IssuedAt     time.Time `json:"issued_at"`
-	RefreshToken string    `json:"refresh_token"`
+func (r *request) doWithRetries(ctx context.Context, responses []*http.Response) (*http.Response, error) {
+	resp, err := r.do(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	responses = append(responses, resp)
+	retry, err := r.retryRequest(ctx, responses)
+	if err != nil {
+		resp.Body.Close()
+		return nil, err
+	}
+	if retry {
+		resp.Body.Close()
+		return r.doWithRetries(ctx, responses)
+	}
+	return resp, err
 }
 
-// getToken fetches a token using a GET request
-func (r *dockerBase) getToken(ctx context.Context, to tokenOptions) (string, error) {
-	req, err := http.NewRequest("GET", to.realm, nil)
-	if err != nil {
-		return "", err
+func (r *request) retryRequest(ctx context.Context, responses []*http.Response) (bool, error) {
+	if len(responses) > 5 {
+		return false, nil
+	}
+	last := responses[len(responses)-1]
+	switch last.StatusCode {
+	case http.StatusUnauthorized:
+		log.G(ctx).WithField("header", last.Header.Get("WWW-Authenticate")).Debug("Unauthorized")
+		if r.host.Authorizer != nil {
+			if err := r.host.Authorizer.AddResponses(ctx, responses); err == nil {
+				return true, nil
+			} else if !errdefs.IsNotImplemented(err) {
+				return false, err
+			}
+		}
+
+		return false, nil
+	case http.StatusMethodNotAllowed:
+		// Support registries which have not properly implemented the HEAD method for
+		// manifests endpoint
+		if r.method == http.MethodHead && strings.Contains(r.path, "/manifests/") {
+			r.method = http.MethodGet
+			return true, nil
+		}
+	case http.StatusRequestTimeout, http.StatusTooManyRequests:
+		return true, nil
 	}
 
-	reqParams := req.URL.Query()
+	// TODO: Handle 50x errors accounting for attempt history
+	return false, nil
+}
 
-	if to.service != "" {
-		reqParams.Add("service", to.service)
+func (r *request) String() string {
+	return r.host.Scheme + "://" + r.host.Host + r.path
+}
+
+func requestFields(req *http.Request) logrus.Fields {
+	fields := map[string]interface{}{
+		"request.method": req.Method,
+	}
+	for k, vals := range req.Header {
+		k = strings.ToLower(k)
+		if k == "authorization" {
+			continue
+		}
+		for i, v := range vals {
+			field := "request.header." + k
+			if i > 0 {
+				field = fmt.Sprintf("%s.%d", field, i)
+			}
+			fields[field] = v
+		}
 	}
 
-	for _, scope := range to.scopes {
-		reqParams.Add("scope", scope)
+	return logrus.Fields(fields)
+}
+
+func responseFields(resp *http.Response) logrus.Fields {
+	fields := map[string]interface{}{
+		"response.status": resp.Status,
+	}
+	for k, vals := range resp.Header {
+		k = strings.ToLower(k)
+		for i, v := range vals {
+			field := "response.header." + k
+			if i > 0 {
+				field = fmt.Sprintf("%s.%d", field, i)
+			}
+			fields[field] = v
+		}
 	}
 
-	if r.secret != "" {
-		req.SetBasicAuth(r.username, r.secret)
-	}
-
-	req.URL.RawQuery = reqParams.Encode()
-
-	resp, err := ctxhttp.Do(ctx, r.client, req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		// TODO: handle error body and write debug output
-		return "", errors.Errorf("unexpected status: %s", resp.Status)
-	}
-
-	decoder := json.NewDecoder(resp.Body)
-
-	var tr getTokenResponse
-	if err = decoder.Decode(&tr); err != nil {
-		return "", fmt.Errorf("unable to decode token response: %s", err)
-	}
-
-	// `access_token` is equivalent to `token` and if both are specified
-	// the choice is undefined.  Canonicalize `access_token` by sticking
-	// things in `token`.
-	if tr.AccessToken != "" {
-		tr.Token = tr.AccessToken
-	}
-
-	if tr.Token == "" {
-		return "", ErrNoToken
-	}
-
-	return tr.Token, nil
+	return logrus.Fields(fields)
 }

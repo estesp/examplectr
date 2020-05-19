@@ -1,3 +1,19 @@
+/*
+   Copyright The containerd Authors.
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
 package containerd
 
 import (
@@ -14,6 +30,8 @@ import (
 
 // Process represents a system process
 type Process interface {
+	// ID of the process
+	ID() string
 	// Pid is the system specific process id
 	Pid() uint32
 	// Start starts the process executing the user's defined binary
@@ -26,7 +44,7 @@ type Process interface {
 	Wait(context.Context) (<-chan ExitStatus, error)
 	// CloseIO allows various pipes to be closed on the process
 	CloseIO(context.Context, ...IOCloserOpts) error
-	// Resize changes the width and heigh of the process's terminal
+	// Resize changes the width and height of the process's terminal
 	Resize(ctx context.Context, w, h uint32) error
 	// IO returns the io set for the process
 	IO() cio.IO
@@ -34,7 +52,16 @@ type Process interface {
 	Status(context.Context) (Status, error)
 }
 
-// ExitStatus encapsulates a process' exit status.
+// NewExitStatus populates an ExitStatus
+func NewExitStatus(code uint32, t time.Time, err error) *ExitStatus {
+	return &ExitStatus{
+		code:     code,
+		exitedAt: t,
+		err:      err,
+	}
+}
+
+// ExitStatus encapsulates a process's exit status.
 // It is used by `Wait()` to return either a process exit code or an error
 type ExitStatus struct {
 	code     uint32
@@ -63,7 +90,7 @@ func (s ExitStatus) ExitTime() time.Time {
 	return s.exitedAt
 }
 
-// Error returns the error, if any, that occured while waiting for the
+// Error returns the error, if any, that occurred while waiting for the
 // process.
 func (s ExitStatus) Error() error {
 	return s.err
@@ -93,9 +120,11 @@ func (p *process) Start(ctx context.Context) error {
 		ExecID:      p.id,
 	})
 	if err != nil {
-		p.io.Cancel()
-		p.io.Wait()
-		p.io.Close()
+		if p.io != nil {
+			p.io.Cancel()
+			p.io.Wait()
+			p.io.Close()
+		}
 		return errdefs.FromGRPC(err)
 	}
 	p.pid = r.Pid
@@ -191,6 +220,7 @@ func (p *process) Delete(ctx context.Context, opts ...ProcessDeleteOpts) (*ExitS
 		return nil, errdefs.FromGRPC(err)
 	}
 	if p.io != nil {
+		p.io.Cancel()
 		p.io.Wait()
 		p.io.Close()
 	}

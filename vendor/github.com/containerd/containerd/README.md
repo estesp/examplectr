@@ -1,9 +1,12 @@
-![banner](/docs/images/containerd-dark.png?raw=true)
+![containerd banner](https://raw.githubusercontent.com/cncf/artwork/master/projects/containerd/horizontal/color/containerd-horizontal-color.png)
 
 [![GoDoc](https://godoc.org/github.com/containerd/containerd?status.svg)](https://godoc.org/github.com/containerd/containerd)
-[![Build Status](https://travis-ci.org/containerd/containerd.svg?branch=master)](https://travis-ci.org/containerd/containerd)
+[![Build Status](https://github.com/containerd/containerd/workflows/CI/badge.svg)](https://github.com/containerd/containerd/actions?query=workflow%3ACI)
+[![Windows Build Status](https://ci.appveyor.com/api/projects/status/github/containerd/containerd?branch=master&svg=true)](https://ci.appveyor.com/project/mlaventure/containerd-3g73f?branch=master)
+[![Nightlies](https://github.com/containerd/containerd/workflows/Nightly/badge.svg)](https://github.com/containerd/containerd/actions?query=workflow%3ANightly)
 [![FOSSA Status](https://app.fossa.io/api/projects/git%2Bhttps%3A%2F%2Fgithub.com%2Fcontainerd%2Fcontainerd.svg?type=shield)](https://app.fossa.io/projects/git%2Bhttps%3A%2F%2Fgithub.com%2Fcontainerd%2Fcontainerd?ref=badge_shield)
 [![Go Report Card](https://goreportcard.com/badge/github.com/containerd/containerd)](https://goreportcard.com/report/github.com/containerd/containerd)
+[![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/1271/badge)](https://bestpractices.coreinfrastructure.org/projects/1271)
 
 containerd is an industry-standard container runtime with an emphasis on simplicity, robustness and portability. It is available as a daemon for Linux and Windows, which can manage the complete container lifecycle of its host system: image transfer and storage, container execution and supervision, low-level storage and network attachments, etc.
 
@@ -13,7 +16,7 @@ containerd is designed to be embedded into a larger system, rather than being us
 
 ## Getting Started
 
-See our documentation on [containerd.io](containerd.io):
+See our documentation on [containerd.io](https://containerd.io):
 * [for ops and admins](docs/ops.md)
 * [namespaces](docs/namespaces.md)
 * [client options](docs/client-opts.md)
@@ -22,6 +25,12 @@ See how to build containerd from source at [BUILDING](BUILDING.md).
 
 If you are interested in trying out containerd see our example at [Getting Started](docs/getting-started.md).
 
+## Nightly builds
+
+There are nightly builds available for download [here](https://github.com/containerd/containerd/actions?query=workflow%3ANightly).
+Binaries are generated from `master` branch every night for `Linux` and `Windows`.
+
+Please be aware: nightly builds might have critical bugs, it's not recommended for use in prodution and no support provided.
 
 ## Runtime Requirements
 
@@ -145,7 +154,7 @@ Taking a container object and turning it into a runnable process on a system is 
 
 ```go
 // create a new task
-task, err := redis.NewTask(context, cio.Stdio)
+task, err := redis.NewTask(context, cio.NewCreator(cio.WithStdio))
 defer task.Delete(context)
 
 // the task is now running and has a pid that can be use to setup networking
@@ -165,33 +174,76 @@ If you have [criu](https://criu.org/Main_Page) installed on your machine you can
 
 ```go
 // checkpoint the task then push it to a registry
-checkpoint, err := task.Checkpoint(context, containerd.WithExit)
+checkpoint, err := task.Checkpoint(context)
 
 err := client.Push(context, "myregistry/checkpoints/redis:master", checkpoint)
 
 // on a new machine pull the checkpoint and restore the redis container
-image, err := client.Pull(context, "myregistry/checkpoints/redis:master")
+checkpoint, err := client.Pull(context, "myregistry/checkpoints/redis:master")
 
-checkpoint := image.Target()
-
-redis, err = client.NewContainer(context, "redis-master", containerd.WithCheckpoint(checkpoint, "redis-rootfs"))
+redis, err = client.NewContainer(context, "redis-master", containerd.WithNewSnapshot("redis-rootfs", checkpoint))
 defer container.Delete(context)
 
-task, err = redis.NewTask(context, cio.Stdio, containerd.WithTaskCheckpoint(checkpoint))
+task, err = redis.NewTask(context, cio.NewCreator(cio.WithStdio), containerd.WithTaskCheckpoint(checkpoint))
 defer task.Delete(context)
 
 err := task.Start(context)
 ```
+
+### Snapshot Plugins
+
+In addition to the built-in Snapshot plugins in containerd, additional external
+plugins can be configured using GRPC. An external plugin is made available using
+the configured name and appears as a plugin alongside the built-in ones.
+
+To add an external snapshot plugin, add the plugin to containerd's config file
+(by default at `/etc/containerd/config.toml`). The string following
+`proxy_plugin.` will be used as the name of the snapshotter and the address
+should refer to a socket with a GRPC listener serving containerd's Snapshot
+GRPC API. Remember to restart containerd for any configuration changes to take
+effect.
+
+```
+[proxy_plugins]
+  [proxy_plugins.customsnapshot]
+    type = "snapshot"
+    address =  "/var/run/mysnapshotter.sock"
+```
+
+See [PLUGINS.md](PLUGINS.md) for how to create plugins
 
 ### Releases and API Stability
 
 Please see [RELEASES.md](RELEASES.md) for details on versioning and stability
 of containerd components.
 
-### Development reports.
+Downloadable 64-bit Intel/AMD binaries of all official releases are available on
+our [releases page](https://github.com/containerd/containerd/releases), as well as
+auto-published to the [cri-containerd-release storage bucket](https://console.cloud.google.com/storage/browser/cri-containerd-release?pli=1).
 
-Weekly summary on the progress and what is being worked on.
-https://github.com/containerd/containerd/tree/master/reports
+For other architectures and distribution support, you will find that many
+Linux distributions package their own containerd and provide it across several
+architectures, such as [Canonical's Ubuntu packaging](https://launchpad.net/ubuntu/bionic/+package/containerd).
+
+#### Enabling command auto-completion
+
+Starting with containerd 1.4, the urfave client feature for auto-creation of bash and zsh
+autocompletion data is enabled. To use the autocomplete feature in a bash shell for example, source
+the autocomplete/ctr file in your `.bashrc`, or manually like:
+
+```
+$ source ./contrib/autocomplete/ctr
+```
+
+#### Distribution of `ctr` autocomplete for bash and zsh
+
+For bash, copy the `contrib/autocomplete/ctr` script into
+`/etc/bash_completion.d/` and rename it to `ctr`. The `zsh_autocomplete`
+file is also available and can be used similarly for zsh users.
+
+Provide documentation to users to `source` this file into their shell if
+you don't place the autocomplete file in a location where it is automatically
+loaded for the user's shell environment.
 
 ### Communication
 
@@ -200,7 +252,12 @@ This will be the best place to discuss design and implementation.
 
 For sync communication we have a community slack with a #containerd channel that everyone is welcome to join and chat about development.
 
-**Slack:** https://dockr.ly/community
+**Slack:** Catch us in the #containerd and #containerd-dev channels on dockercommunity.slack.com.
+[Click here for an invite to docker community slack.](https://dockr.ly/slack)
+
+### Security audit
+
+A third party security audit was performed by Cure53 in 4Q2018; the [full report](docs/SECURITY_AUDIT.pdf) is available in our docs/ directory.
 
 ### Reporting security issues
 
@@ -208,8 +265,25 @@ __If you are reporting a security issue, please reach out discreetly at security
 
 ## Licenses
 
-The containerd codebase is released under the [Apache 2.0 license](LICENSE.code).
+The containerd codebase is released under the [Apache 2.0 license](LICENSE).
 The README.md file, and files in the "docs" folder are licensed under the
-Creative Commons Attribution 4.0 International License under the terms and
-conditions set forth in the file "[LICENSE.docs](LICENSE.docs)". You may obtain a duplicate
-copy of the same license, titled CC-BY-4.0, at http://creativecommons.org/licenses/by/4.0/.
+Creative Commons Attribution 4.0 International License. You may obtain a
+copy of the license, titled CC-BY-4.0, at http://creativecommons.org/licenses/by/4.0/.
+
+## Project details
+
+**containerd** is the primary open source project within the broader containerd GitHub repository.
+However, all projects within the repo have common maintainership, governance, and contributing
+guidelines which are stored in a `project` repository commonly for all containerd projects.
+
+Please find all these core project documents, including the:
+ * [Project governance](https://github.com/containerd/project/blob/master/GOVERNANCE.md),
+ * [Maintainers](https://github.com/containerd/project/blob/master/MAINTAINERS),
+ * and [Contributing guidelines](https://github.com/containerd/project/blob/master/CONTRIBUTING.md)
+
+information in our [`containerd/project`](https://github.com/containerd/project) repository.
+
+## Adoption
+
+Interested to see who is using containerd? Are you using containerd in a project?
+Please add yourself via pull request to our [ADOPTERS.md](./ADOPTERS.md) file.

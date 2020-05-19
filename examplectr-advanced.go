@@ -9,7 +9,6 @@ import (
 
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/cio"
-	"github.com/containerd/containerd/linux/runctypes"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/oci"
 	"github.com/estesp/examplectr/idtools"
@@ -125,10 +124,10 @@ func (c *cc) runContainer() (containerd.ExitStatus, error) {
 	if c.idMappings != nil {
 		rootPair := c.idMappings.RootPair()
 		newTaskOpts = append(newTaskOpts, func(_ context.Context, client *containerd.Client, r *containerd.TaskInfo) error {
-			r.Options = &runctypes.CreateOptions{
-				IoUid: uint32(rootPair.UID),
-				IoGid: uint32(rootPair.GID),
-			}
+			//r.Options = &runctypes.CreateOptions{
+			//	IoUid: uint32(rootPair.UID),
+			//	IoGid: uint32(rootPair.GID),
+			//}
 			return nil
 		})
 	}

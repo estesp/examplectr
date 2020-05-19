@@ -1,3 +1,19 @@
+/*
+   Copyright The containerd Authors.
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
 package remotes
 
 import (
@@ -56,9 +72,9 @@ func (fn FetcherFunc) Fetch(ctx context.Context, desc ocispec.Descriptor) (io.Re
 
 // PusherFunc allows package users to implement a Pusher with just a
 // function.
-type PusherFunc func(ctx context.Context, desc ocispec.Descriptor, r io.Reader) error
+type PusherFunc func(ctx context.Context, desc ocispec.Descriptor) (content.Writer, error)
 
 // Push content
-func (fn PusherFunc) Push(ctx context.Context, desc ocispec.Descriptor, r io.Reader) error {
-	return fn(ctx, desc, r)
+func (fn PusherFunc) Push(ctx context.Context, desc ocispec.Descriptor) (content.Writer, error) {
+	return fn(ctx, desc)
 }

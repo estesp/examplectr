@@ -1,9 +1,26 @@
+/*
+   Copyright The containerd Authors.
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
 package plugin
 
 import (
 	"fmt"
 	"sync"
 
+	"github.com/containerd/ttrpc"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 )
@@ -13,7 +30,8 @@ var (
 	ErrNoType = errors.New("plugin: no type")
 	// ErrNoPluginID is returned when no id is specified
 	ErrNoPluginID = errors.New("plugin: no id")
-
+	// ErrIDRegistered is returned when a duplicate id is already registered
+	ErrIDRegistered = errors.New("plugin: id already registered")
 	// ErrSkipPlugin is used when a plugin is not initialized and should not be loaded,
 	// this allows the plugin loader differentiate between a plugin which is configured
 	// not to load and one that fails to load.
@@ -26,10 +44,7 @@ var (
 
 // IsSkipPlugin returns true if the error is skipping the plugin
 func IsSkipPlugin(err error) bool {
-	if errors.Cause(err) == ErrSkipPlugin {
-		return true
-	}
-	return false
+	return errors.Is(err, ErrSkipPlugin)
 }
 
 // Type is the type of the plugin
@@ -38,10 +53,14 @@ type Type string
 func (t Type) String() string { return string(t) }
 
 const (
-	// AllPlugins declares that the plugin should be initialized after all others.
-	AllPlugins Type = "*"
+	// InternalPlugin implements an internal plugin to containerd
+	InternalPlugin Type = "io.containerd.internal.v1"
 	// RuntimePlugin implements a runtime
 	RuntimePlugin Type = "io.containerd.runtime.v1"
+	// RuntimePluginV2 implements a runtime v2
+	RuntimePluginV2 Type = "io.containerd.runtime.v2"
+	// ServicePlugin implements a internal service
+	ServicePlugin Type = "io.containerd.service.v1"
 	// GRPCPlugin implements a grpc service
 	GRPCPlugin Type = "io.containerd.grpc.v1"
 	// SnapshotPlugin implements a snapshotter
@@ -58,6 +77,15 @@ const (
 	GCPlugin Type = "io.containerd.gc.v1"
 )
 
+const (
+	// RuntimeLinuxV1 is the legacy linux runtime
+	RuntimeLinuxV1 = "io.containerd.runtime.v1.linux"
+	// RuntimeRuncV1 is the runc runtime that supports a single container
+	RuntimeRuncV1 = "io.containerd.runc.v1"
+	// RuntimeRuncV2 is the runc runtime that supports multiple containers per shim
+	RuntimeRuncV2 = "io.containerd.runc.v2"
+)
+
 // Registration contains information for registering a plugin
 type Registration struct {
 	// Type of the plugin
@@ -71,8 +99,10 @@ type Registration struct {
 
 	// InitFn is called when initializing a plugin. The registration and
 	// context are passed in. The init function may modify the registration to
-	// add exports, capabilites and platform support declarations.
+	// add exports, capabilities and platform support declarations.
 	InitFn func(*InitContext) (interface{}, error)
+	// Disable the plugin from loading
+	Disable bool
 }
 
 // Init the registered plugin
@@ -95,6 +125,16 @@ func (r *Registration) URI() string {
 // Service allows GRPC services to be registered with the underlying server
 type Service interface {
 	Register(*grpc.Server) error
+}
+
+// TTRPCService allows TTRPC services to be registered with the underlying server
+type TTRPCService interface {
+	RegisterTTRPC(*ttrpc.Server) error
+}
+
+// TCPService allows GRPC services to be registered with the underlying tcp server
+type TCPService interface {
+	RegisterTCP(*grpc.Server) error
 }
 
 var register = struct {
@@ -120,11 +160,15 @@ func Load(path string) (err error) {
 func Register(r *Registration) {
 	register.Lock()
 	defer register.Unlock()
+
 	if r.Type == "" {
 		panic(ErrNoType)
 	}
 	if r.ID == "" {
 		panic(ErrNoPluginID)
+	}
+	if err := checkUnique(r); err != nil {
+		panic(err)
 	}
 
 	var last bool
@@ -140,15 +184,36 @@ func Register(r *Registration) {
 	register.r = append(register.r, r)
 }
 
-// Graph returns an ordered list of registered plugins for initialization
-func Graph() (ordered []*Registration) {
+func checkUnique(r *Registration) error {
+	for _, registered := range register.r {
+		if r.URI() == registered.URI() {
+			return errors.Wrap(ErrIDRegistered, r.URI())
+		}
+	}
+	return nil
+}
+
+// DisableFilter filters out disabled plugins
+type DisableFilter func(r *Registration) bool
+
+// Graph returns an ordered list of registered plugins for initialization.
+// Plugins in disableList specified by id will be disabled.
+func Graph(filter DisableFilter) (ordered []*Registration) {
 	register.RLock()
 	defer register.RUnlock()
 
+	for _, r := range register.r {
+		if filter(r) {
+			r.Disable = true
+		}
+	}
+
 	added := map[*Registration]bool{}
 	for _, r := range register.r {
-
-		children(r.ID, r.Requires, added, &ordered)
+		if r.Disable {
+			continue
+		}
+		children(r, added, &ordered)
 		if !added[r] {
 			ordered = append(ordered, r)
 			added[r] = true
@@ -157,11 +222,13 @@ func Graph() (ordered []*Registration) {
 	return ordered
 }
 
-func children(id string, types []Type, added map[*Registration]bool, ordered *[]*Registration) {
-	for _, t := range types {
+func children(reg *Registration, added map[*Registration]bool, ordered *[]*Registration) {
+	for _, t := range reg.Requires {
 		for _, r := range register.r {
-			if r.ID != id && (t == "*" || r.Type == t) {
-				children(r.ID, r.Requires, added, ordered)
+			if !r.Disable &&
+				r.URI() != reg.URI() &&
+				(t == "*" || r.Type == t) {
+				children(r, added, ordered)
 				if !added[r] {
 					*ordered = append(*ordered, r)
 					added[r] = true
