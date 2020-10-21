@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -11,13 +10,15 @@ import (
 	"github.com/containerd/containerd/cio"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/oci"
+	"github.com/containerd/containerd/runtime/v2/runc/options"
 	"github.com/estesp/examplectr/idtools"
+	rspec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 )
 
 const (
-	defaultContainerdPath = "/run/containerd2/containerd.sock"
+	defaultContainerdPath = "/run/containerd/containerd.sock"
 	defaultImage          = "docker.io/library/alpine:latest"
 )
 
@@ -33,16 +34,18 @@ type cc struct {
 
 func main() {
 	var (
-		username  string
-		imageName string
-		command   string
+		err        error
+		username   string
+		imageName  string
+		command    string
+		idMappings *idtools.IDMappings
 	)
 
 	// usage: ./examplectr <user> [<image> <command>]
 	switch len(os.Args) {
 	case 1:
-		log.Errorf("Must provide at least a username for a container")
-		os.Exit(-1)
+		log.Warnf("Not running with user namespaces")
+		imageName = defaultImage
 	case 2:
 		username = os.Args[1]
 		imageName = defaultImage
@@ -60,10 +63,12 @@ func main() {
 	}
 
 	// check for id mappings for user namespaces
-	idMappings, err := idtools.NewIDMappings(username, username)
-	if err != nil {
-		log.Errorf("error finding ID mappings for user %s: %v", username, err)
-		os.Exit(-1)
+	if username != "" {
+		idMappings, err = idtools.NewIDMappings(username, username)
+		if err != nil {
+			log.Errorf("error finding ID mappings for user %s: %v", username, err)
+			os.Exit(-1)
+		}
 	}
 
 	// connect to containerd daemon over UNIX socket
@@ -119,19 +124,20 @@ func (c *cc) runContainer() (containerd.ExitStatus, error) {
 	}
 
 	// create a task
-	newTaskOpts := []containerd.NewTaskOpts{}
-	stdouterr := bytes.NewBuffer(nil)
+	var task containerd.Task
 	if c.idMappings != nil {
 		rootPair := c.idMappings.RootPair()
-		newTaskOpts = append(newTaskOpts, func(_ context.Context, client *containerd.Client, r *containerd.TaskInfo) error {
-			//r.Options = &runctypes.CreateOptions{
-			//	IoUid: uint32(rootPair.UID),
-			//	IoGid: uint32(rootPair.GID),
-			//}
+		copts := &options.Options{
+			IoUid: uint32(rootPair.UID),
+			IoGid: uint32(rootPair.GID),
+		}
+		task, err = container.NewTask(c.ctx, cio.NewCreator(cio.WithStdio), func(_ context.Context, client *containerd.Client, r *containerd.TaskInfo) error {
+			r.Options = copts
 			return nil
 		})
+	} else {
+		task, err = container.NewTask(c.ctx, cio.NewCreator(cio.WithStdio))
 	}
-	task, err := container.NewTask(c.ctx, cio.NewIO(bytes.NewBuffer(nil), stdouterr, stdouterr), newTaskOpts...)
 	if err != nil {
 		return containerd.ExitStatus{}, errors.Wrap(err, "error creating task")
 	}
@@ -156,7 +162,6 @@ func (c *cc) runContainer() (containerd.ExitStatus, error) {
 
 	if c.command != "" {
 		exitStatus := <-statusC
-		fmt.Printf("%s", string(stdouterr.Bytes()))
 		return exitStatus, nil
 	}
 	return containerd.ExitStatus{}, nil
@@ -174,19 +179,30 @@ func (c *cc) newContainer(image containerd.Image) (containerd.Container, error) 
 	if c.idMappings != nil {
 		rootPair := c.idMappings.RootPair()
 		uidMaps := c.idMappings.UIDs()
+		idMaps := convertToOCI(uidMaps)
 		// use user namespaces for this container
-		specOpts = append(specOpts, oci.WithUserNamespace(uint32(uidMaps[0].ContainerID),
-			uint32(uidMaps[0].HostID), uint32(uidMaps[0].Size)))
+		specOpts = append(specOpts, oci.WithUserNamespace(idMaps, idMaps))
 		newOpts = append(newOpts, containerd.WithRemappedSnapshot(c.name, image,
 			uint32(rootPair.UID), uint32(rootPair.GID)))
 	} else {
 		newOpts = append(newOpts, containerd.WithNewSnapshot(c.name, image))
 	}
-	// allow for local bind mounts with our helper function
-	specOpts = append(specOpts, withMounts())
 	newOpts = append(newOpts, containerd.WithNewSpec(specOpts...))
 
 	return c.client.NewContainer(c.ctx, c.name, newOpts...)
+}
+
+func convertToOCI(idMap []idtools.IDMap) []rspec.LinuxIDMapping {
+	idMaps := make([]rspec.LinuxIDMapping, len(idMap))
+	for i, im := range idMap {
+		newMap := rspec.LinuxIDMapping{
+			ContainerID: uint32(im.ContainerID),
+			HostID:      uint32(im.HostID),
+			Size:        uint32(im.Size),
+		}
+		idMaps[i] = newMap
+	}
+	return idMaps
 }
 
 func (c *cc) printVersion() {
